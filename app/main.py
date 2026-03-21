@@ -5680,219 +5680,65 @@ def realtime_submit_session_review(
     return {"ok": True, "session_id": session_id, "review": review}
 
 
-def _detect_transcript_language(chunks: List[str], preferred: Optional[str] = None) -> str:
-    raw_pref = (preferred or "").strip()
-    if raw_pref in {"pt", "pt-BR"}:
-        return "pt-BR"
-    if raw_pref in {"en", "en-US"}:
-        return "en"
-
-    text_blob = " ".join([(c or "").strip() for c in chunks if (c or "").strip()]).lower()
-    if not text_blob:
-        return "pt-BR"
-
-    pt_markers = [
-        " você ", " vocês ", " não ", " para ", " com ", " uma ", " isso ", " agora ", " então ",
-        " obrigado ", " obrigada ", " bom ", " vamos ", " ata ", " reunião ", " projeto ", " ajuste ",
-        " idioma ", " ruído ", " ruídos ", " falar ", " falando ", " preciso ", " precisa ", " temos ",
-        " aqui ", " porque ", " também ", " certo ", " por favor ", " transcrição ", " sessão ",
-    ]
-    en_markers = [
-        " you ", " your ", " the ", " and ", " with ", " this ", " that ", " now ", " thanks ",
-        " thank you ", " meeting ", " project ", " language ", " transcript ", " session ",
-        " report ", " need ", " adjust ", " audio ", " voice ", " please ", " noise ",
-    ]
-
-    padded = f" {text_blob} "
-    pt_score = sum(1 for marker in pt_markers if marker in padded)
-    en_score = sum(1 for marker in en_markers if marker in padded)
-
-    if pt_score == en_score:
-        ascii_ratio = (sum(1 for ch in text_blob if ord(ch) < 128) / max(1, len(text_blob)))
-        if ascii_ratio > 0.985 and any(tok in padded for tok in [" the ", " and ", " you ", " please "]):
-            return "en"
-        return "pt-BR"
-    return "pt-BR" if pt_score > en_score else "en"
-
-
-def _build_executive_report_from_events(
+def _build_executive_report_from_messages(
     org: str,
     rs: RealtimeSession,
-    events: List[RealtimeEvent],
+    messages: List[Message],
 ) -> str:
-    """Build a summit-friendly ATA from persisted realtime finals only.
-    Source of truth is realtime_events, not thread chat messages, so live voice captions
-    never need to leak into the visible chat to appear in the exported ATA.
-    """
+    """Build a summit-friendly executive report from persisted thread messages."""
     def _clean(v: Optional[str]) -> str:
-        return (v or "").replace("
-", "
-").replace("
-", "
-").strip()
-
-    def _fmt_dt(ts: Optional[int]) -> str:
-        if not ts:
-            return ""
-        try:
-            dt = time.localtime(int(ts))
-            return time.strftime("%Y-%m-%d %H:%M:%S", dt)
-        except Exception:
-            return ""
-
-    try:
-        session_meta = json.loads(rs.meta) if rs.meta else {}
-    except Exception:
-        session_meta = {}
-
-    preferred_language = (
-        session_meta.get("language_profile")
-        or session_meta.get("detected_language")
-        or os.getenv("SUMMIT_LANGUAGE_PROFILE", "auto")
-    )
+        return (v or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
     cleaned = []
-    language_samples: List[str] = []
-    for ev in events:
-        event_type = (getattr(ev, "event_type", "") or "").strip().lower()
-        if not event_type.endswith(".final"):
-            continue
-        role = (getattr(ev, "role", "") or "").strip().lower()
-        if role not in {"user", "assistant"}:
-            continue
-
-        body = _clean(getattr(ev, "transcript_punct", None) or getattr(ev, "content", None))
+    for m in messages:
+        body = _clean(getattr(m, "content", None))
         if not body:
             continue
-
-        meta = {}
-        try:
-            meta = json.loads(getattr(ev, "meta", None) or "{}")
-        except Exception:
-            meta = {}
-
-        if role == "user":
-            speaker = _clean(getattr(rs, "user_name", None)) or "User"
-        else:
-            speaker = _clean(getattr(ev, "agent_name", None) or getattr(rs, "agent_name", None)) or "Orkio"
-
-        cleaned.append({
-            "speaker": speaker,
-            "role": role,
-            "content": body,
-            "created_at": getattr(ev, "created_at", None),
-            "source": meta.get("source"),
-        })
-        language_samples.append(body)
-
-    resolved_language = _detect_transcript_language(language_samples, preferred_language)
-
-    labels = {
-        "pt-BR": {
-            "title": "ORKIO AI — ATA DE SESSÃO REALTIME",
-            "conversation": "TRANSCRIÇÃO DA SESSÃO",
-            "summary": "RESUMO EXECUTIVO",
-            "discussion": "PONTOS PRINCIPAIS",
-            "insights": "INSIGHTS ESTRATÉGICOS",
-            "recommendations": "RECOMENDAÇÕES",
-            "next_steps": "PRÓXIMOS PASSOS",
-            "empty": "[info] Ainda não há eventos finais persistidos para esta sessão.",
-            "speaker_user": "Usuário",
-            "fallback_summary": "Sessão estratégica entre o usuário e o agente Orkio.",
-            "fallback_next": "Revisar a conversa e confirmar a ação prioritária.",
-            "prompt": (
-                "Você está gerando uma ata executiva a partir de uma sessão de voz entre usuário e agente. "
-                "Escreva em português do Brasil, sem misturar idiomas. "
-                "Mantenha fidelidade absoluta ao conteúdo. Não invente fatos. "
-                "Use exatamente esta estrutura:
-"
-                "RESUMO EXECUTIVO
-"
-                "PONTOS PRINCIPAIS
-"
-                "INSIGHTS ESTRATÉGICOS
-"
-                "RECOMENDAÇÕES
-"
-                "PRÓXIMOS PASSOS
-
-"
-                "Tom profissional, claro e objetivo."
-            ),
-        },
-        "en": {
-            "title": "ORKIO AI — REALTIME SESSION MINUTES",
-            "conversation": "SESSION TRANSCRIPT",
-            "summary": "EXECUTIVE SUMMARY",
-            "discussion": "KEY DISCUSSION",
-            "insights": "STRATEGIC INSIGHTS",
-            "recommendations": "RECOMMENDATIONS",
-            "next_steps": "NEXT STEPS",
-            "empty": "[info] No persisted final realtime events were found for this session yet.",
-            "speaker_user": "User",
-            "fallback_summary": "Strategic session between the user and the Orkio agent.",
-            "fallback_next": "Review the discussion and confirm the top-priority action.",
-            "prompt": (
-                "You are generating executive minutes from a voice session between a user and an AI agent. "
-                "Write only in English, without mixing languages. "
-                "Stay fully faithful to the content. Do not invent facts. "
-                "Use exactly this structure:
-"
-                "EXECUTIVE SUMMARY
-"
-                "KEY DISCUSSION
-"
-                "STRATEGIC INSIGHTS
-"
-                "RECOMMENDATIONS
-"
-                "NEXT STEPS
-
-"
-                "Use a professional, clear, concise tone."
-            ),
-        },
-    }
-    i18n = labels["pt-BR" if resolved_language == "pt-BR" else "en"]
-
-    for item in cleaned:
-        if item["role"] == "user":
-            item["speaker"] = item["speaker"] or i18n["speaker_user"]
+        if body == "⌛ Preparando resposta...":
+            continue
+        role = (getattr(m, "role", "") or "").lower()
+        speaker = "User" if role == "user" else (_clean(getattr(m, "agent_name", None)) or "Orkio")
+        cleaned.append({"speaker": speaker, "role": role, "content": body, "created_at": getattr(m, "created_at", None)})
 
     header = [
-        i18n["title"],
+        "ORKIO AI EXECUTIVE REPORT",
         f"session_id: {rs.id}",
         f"thread_id: {rs.thread_id}",
         f"agent_name: {rs.agent_name or ''}",
-        f"language: {resolved_language}",
-        f"started_at: {_fmt_dt(rs.started_at)}",
-        f"ended_at: {_fmt_dt(rs.ended_at)}",
+        f"started_at: {rs.started_at or ''}",
+        f"ended_at: {rs.ended_at or ''}",
         "",
     ]
     if not cleaned:
-        return "
-".join(header + [i18n["empty"], ""])
+        return "\n".join(header + ["[info] No persisted conversation messages were found for this session yet.", ""]) 
 
     transcript_lines = []
     for item in cleaned:
-        ts_label = _fmt_dt(item["created_at"])
-        prefix = f"[{ts_label}] " if ts_label else ""
-        transcript_lines.append(f"{prefix}{item['speaker']}: {item['content']}")
-    transcript = "
-".join(transcript_lines)
+        transcript_lines.append(f"{item['speaker']}: {item['content']}")
+    transcript = "\n".join(transcript_lines)
+
+    summary_prompt = (
+        "You are generating an executive meeting report from an AI board conversation. "
+        "Write in professional English for founders and investors. "
+        "Use this exact structure:\n"
+        "SESSION SUMMARY\n"
+        "KEY DISCUSSION\n"
+        "EXECUTIVE INSIGHTS\n"
+        "STRATEGIC RECOMMENDATIONS\n"
+        "NEXT STEPS\n\n"
+        "Be faithful to the conversation. Do not invent facts. Keep it concise but polished."
+    )
 
     report_body = ""
     try:
         report_model = (os.getenv("EXEC_REPORT_MODEL", "").strip() or "gpt-4o")
         ans = _openai_answer(
-            user_message=f"Realtime session transcript:
-
-{transcript}",
+            user_message=f"Conversation transcript:\n\n{transcript}",
             context_chunks=[],
             history=None,
-            system_prompt=i18n["prompt"],
+            system_prompt=summary_prompt,
             model_override=report_model,
-            temperature=0.2,
+            temperature=0.3,
         )
         if isinstance(ans, dict):
             report_body = (ans.get("text") or "").strip()
@@ -5900,48 +5746,33 @@ def _build_executive_report_from_events(
         report_body = ""
 
     if not report_body:
+        # deterministic fallback
         insights = []
         next_steps = []
         for item in cleaned:
             if item["role"] == "assistant":
                 if len(insights) < 3:
                     insights.append(item["content"])
-                lower = item["content"].lower()
-                if len(next_steps) < 3 and any(k in lower for k in ["recommend", "next", "should", "priorit", "focus", "recom", "próxim", "deve", "foco"]):
+                if len(next_steps) < 3 and any(k in item["content"].lower() for k in ["recommend", "next", "should", "priorit", "focus"]):
                     next_steps.append(item["content"])
-        if not insights and cleaned:
+        if not insights:
             insights = [cleaned[-1]["content"]]
         if not next_steps:
-            next_steps = [i18n["fallback_next"]]
-        bullet_block = "
-- " + "
-- ".join(insights[:3]) if insights else ""
-        next_block = "
-- " + "
-- ".join(next_steps[:3])
-
+            next_steps = ["Review the discussion and confirm the highest-priority action."]
         report_body = (
-            f"{i18n['summary']}
-"
-            f"{i18n['fallback_summary']}
+            "SESSION SUMMARY\n"
+            "Strategic conversation between the user and the Orkio executive board.\n\n"
+            "KEY DISCUSSION\n"
+            + "\n".join(transcript_lines)
+            + "\n\nEXECUTIVE INSIGHTS\n- "
+            + "\n- ".join(insights[:3])
+            + "\n\nSTRATEGIC RECOMMENDATIONS\n- "
+            + "\n- ".join(insights[:3])
+            + "\n\nNEXT STEPS\n- "
+            + "\n- ".join(next_steps[:3])
+        )
 
-"
-            f"{i18n['discussion']}
-"
-            f"{transcript}
-
-"
-            f"{i18n['insights']}{bullet_block}
-
-"
-            f"{i18n['recommendations']}{bullet_block}
-
-"
-            f"{i18n['next_steps']}{next_block}"
-        ).strip()
-
-    return "
-".join(header + [i18n["conversation"], transcript, "", report_body.strip(), ""])
+    return "\n".join(header + ["CONVERSATION", transcript, "", report_body.strip(), ""])
 
 @app.get("/api/realtime/sessions/{session_id}/ata.txt")
 def realtime_get_session_ata(
@@ -5966,16 +5797,16 @@ def realtime_get_session_ata(
     if user.get("role") != "admin":
         _require_thread_member(db, org, rs.thread_id, uid)
 
-    evs = db.execute(
-        select(RealtimeEvent)
+    msgs = db.execute(
+        select(Message)
         .where(
-            RealtimeEvent.org_slug == org,
-            RealtimeEvent.session_id == rs.id,
+            Message.org_slug == org,
+            Message.thread_id == rs.thread_id,
         )
-        .order_by(RealtimeEvent.created_at.asc(), RealtimeEvent.id.asc())
+        .order_by(Message.created_at.asc(), Message.id.asc())
     ).scalars().all()
 
-    payload = _build_executive_report_from_events(org, rs, evs).strip() + "\n"
+    payload = _build_executive_report_from_messages(org, rs, msgs).strip() + "\n"
     filename = f"orkio-ata-{rs.id}.txt"
     return Response(
         content=payload.encode("utf-8"),
