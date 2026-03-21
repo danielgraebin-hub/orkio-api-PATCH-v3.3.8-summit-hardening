@@ -1539,6 +1539,16 @@ def _save_user_onboarding_compat(
 
 
 
+@app.post("/api/user/onboarding")
+def save_user_onboarding_compat_post(
+    payload: OnboardingPayloadCompat,
+    x_org_slug: Optional[str] = Header(default=None),
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return _save_user_onboarding_compat(payload, user, x_org_slug, db)
+
+
 @app.put("/api/user/onboarding")
 def save_user_onboarding_compat_put(
     payload: OnboardingPayloadCompat,
