@@ -2365,6 +2365,15 @@ def delete_thread(thread_id: str, x_org_slug: Optional[str] = Header(default=Non
 
 
 
+def _orkio_welcome_message(name: Optional[str]) -> str:
+    first_name = ((name or "").strip().split(" ")[0] if name else "") or "seja bem-vindo"
+    return (
+        f"Olá, {first_name}. Como vai seu dia?\n\n"
+        "Prazer em ter você aqui. Eu sou o Orkio. "
+        "Estou à sua disposição para orientar você na plataforma, esclarecer dúvidas e acelerar o que for prioridade para você agora."
+    )
+
+
 @app.get("/api/messages")
 def list_messages(thread_id: str, x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
     org = get_request_org(user, x_org_slug)
@@ -2373,6 +2382,32 @@ def list_messages(thread_id: str, x_org_slug: Optional[str] = Header(default=Non
     if user.get("role") != "admin":
         _require_thread_member(db, org, thread_id, user.get("sub"))
     rows = db.execute(select(Message).where(Message.org_slug == org, Message.thread_id == thread_id).order_by(Message.created_at.asc())).scalars().all()
+
+    if not rows:
+        try:
+            orkio = db.execute(
+                select(Agent).where(
+                    Agent.org_slug == org,
+                    ((Agent.is_default == True) | (Agent.name.ilike("%orkio%")))
+                ).order_by(Agent.is_default.desc(), Agent.created_at.asc())
+            ).scalars().first()
+        except Exception:
+            orkio = None
+
+        welcome = Message(
+            id=new_id(),
+            org_slug=org,
+            thread_id=thread_id,
+            role="assistant",
+            content=_orkio_welcome_message(user.get("name")),
+            created_at=now_ts(),
+            agent_id=(orkio.id if orkio else None),
+            agent_name=(orkio.name if orkio else "Orkio"),
+        )
+        db.add(welcome)
+        db.commit()
+        rows = [welcome]
+
     return [{
         "id": m.id,
         "role": m.role,
