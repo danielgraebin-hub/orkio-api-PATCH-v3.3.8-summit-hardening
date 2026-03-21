@@ -73,8 +73,7 @@ class OnboardingIn(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=1200)
     onboarding_completed: bool = True
 
-@router.post("/api/user/onboarding")
-def complete_onboarding(inp: OnboardingIn, user=Depends(_current_user), db: Session = Depends(get_db)):
+def _complete_onboarding(inp: OnboardingIn, user: Dict[str, Any], db: Session):
     uid = user.get("sub")
     u = db.execute(select(User).where(User.id == uid)).scalar_one_or_none()
     if not u:
@@ -104,3 +103,11 @@ def complete_onboarding(inp: OnboardingIn, user=Depends(_current_user), db: Sess
             "onboarding_completed": bool(u.onboarding_completed),
         },
     }
+
+@router.post("/api/user/onboarding")
+def complete_onboarding_post(inp: OnboardingIn, user=Depends(_current_user), db: Session = Depends(get_db)):
+    return _complete_onboarding(inp, user, db)
+
+@router.put("/api/user/onboarding")
+def complete_onboarding_put(inp: OnboardingIn, user=Depends(_current_user), db: Session = Depends(get_db)):
+    return _complete_onboarding(inp, user, db)
