@@ -494,6 +494,43 @@ def _serialize_user_payload(u: User, usage_tier: Optional[str] = None) -> Dict[s
         "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
     }
 
+def _auth_status_for_user(u: Optional[User]) -> str:
+    if not u:
+        return "invalid_credentials"
+    if not _is_user_approved(u):
+        return "pending_approval"
+    if bool(getattr(u, "onboarding_completed", False)):
+        return "approved_ready"
+    return "approved_onboarding_pending"
+
+def _build_auth_response(u: User, org: str, usage_tier: Optional[str], *, ip: Optional[str] = None) -> Dict[str, Any]:
+    user_payload = _serialize_user_payload(u, usage_tier)
+    auth_status = _auth_status_for_user(u)
+    onboarding_completed = bool(user_payload.get("onboarding_completed"))
+    payload: Dict[str, Any] = {
+        "user": user_payload,
+        "auth_status": auth_status,
+        "onboarding_completed": onboarding_completed,
+        "pending_approval": auth_status == "pending_approval",
+    }
+    if auth_status == "pending_approval":
+        payload["message"] = "Sua identidade foi validada. Seu acesso ainda depende de aprovação manual."
+        return payload
+
+    token_payload = {
+        "sub": u.id,
+        "org": org,
+        "email": u.email,
+        "name": u.name,
+        "role": u.role,
+        "approved_at": getattr(u, "approved_at", None),
+        "usage_tier": usage_tier,
+        "onboarding_completed": onboarding_completed,
+    }
+    payload["access_token"] = mint_token(token_payload)
+    payload["token_type"] = "bearer"
+    return payload
+
 def enable_streaming() -> bool:
     return os.getenv("ENABLE_STREAMING", "0").strip() in ("1", "true", "True")
 
@@ -837,11 +874,13 @@ class FeatureFlagIn(BaseModel):
     flag_value: str = Field(default="true")
 
 class TokenOut(BaseModel):
-    # Supports both approved login/register (with token) and pending-approval register responses.
+    # Supports approved, pending-approval and onboarding-pending flows.
     access_token: Optional[str] = None
     token_type: str = "bearer"
     user: Dict[str, Any]
     pending_approval: bool = False
+    auth_status: Optional[str] = None
+    onboarding_completed: Optional[bool] = None
     message: Optional[str] = None
 
 class ThreadIn(BaseModel):
@@ -2191,28 +2230,15 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     except Exception:
         logger.exception("ADMIN_SYNC_FAILED register user_id=%s", getattr(u, "id", None))
 
-    user_payload = {
-        "id": u.id,
-        "email": u.email,
-        "name": u.name,
-        "role": u.role,
-        "approved_at": getattr(u, "approved_at", None),
-        "usage_tier": usage_tier,
-    }
-
-    if not _is_user_approved(u):
-        return {
-            "pending_approval": True,
-            "message": "Conta criada com sucesso. Sua identidade será verificada por OTP no login e o acesso ao app será liberado após aprovação manual.",
-            "user": user_payload,
-        }
-
-    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier})
+    response = _build_auth_response(u, org, usage_tier)
+    if response.get("pending_approval"):
+        response["message"] = "Conta criada com sucesso. Sua identidade será verificada por OTP no login e o acesso ao app será liberado após aprovação manual."
+        return response
 
     # Create user session for presence tracking
     _create_user_session(db, u.id, org, ip, signup_code_label, usage_tier)
 
-    return {"access_token": token, "token_type": "bearer", "user": user_payload}
+    return response
 
 @app.post("/api/auth/login")
 def login(inp: LoginIn, x_org_slug: Optional[str] = Header(default=None), db: Session = Depends(get_db), request: Request = None):
@@ -2283,20 +2309,14 @@ def login(inp: LoginIn, x_org_slug: Optional[str] = Header(default=None), db: Se
                 raise HTTPException(status_code=500, detail="Falha ao enviar código de verificação. Tente novamente.")
         return {"pending_otp": True, "message": "Enviamos um código de verificação para seu e-mail. Digite-o para continuar.", "email": email, "tenant": org}
 
-    user_payload = _serialize_user_payload(u, usage_tier)
-    if not _is_user_approved(u):
-        return {
-            "pending_approval": True,
-            "message": "Identidade validada. Seu acesso ainda depende de aprovação manual.",
-            "user": user_payload,
-        }
-
-    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier})
+    response = _build_auth_response(u, org, usage_tier)
+    if response.get("pending_approval"):
+        return response
 
     # Create user session for presence tracking
     _create_user_session(db, u.id, org, ip, getattr(u, "signup_code_label", None), usage_tier)
 
-    return {"access_token": token, "token_type": "bearer", "user": user_payload}
+    return response
 
 @app.get("/api/threads")
 def list_threads(x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
@@ -5420,7 +5440,7 @@ def realtime_events_batch(
 ):
     """Persist a batch of realtime events for auditability.
     This is the preferred path for WebRTC clients to avoid per-event HTTP overhead.
-    For each event with is_final=True, we also persist a Message into the thread timeline.
+    Final realtime transcripts stay in realtime_events and MUST NOT pollute the text chat timeline.
     """
     org = _resolve_org(user, x_org_slug)
     uid = user.get("sub")
@@ -5434,7 +5454,6 @@ def realtime_events_batch(
 
     now = int(now_ts())
     ev_rows: List[RealtimeEvent] = []
-    msg_rows: List[Message] = []
     punct_ids: List[str] = []
 
     for item in body.events:
@@ -5485,27 +5504,8 @@ def realtime_events_batch(
         except Exception:
             pass
 
-        if item.is_final and (item.content or "").strip():
-            role = "user" if item.role == "user" else "assistant"
-            msg_rows.append(
-                Message(
-                    id=new_id(),
-                    org_slug=org,
-                    thread_id=rs.thread_id,
-                    user_id=rs.user_id if role == "user" else None,
-                    user_name=rs.user_name if role == "user" else None,
-                    role=role,
-                    content=item.content,
-                    agent_id=rs.agent_id if role != "user" else None,
-                    agent_name=rs.agent_name if role != "user" else None,
-                    created_at=ts,
-                )
-            )
-
     if ev_rows:
         db.add_all(ev_rows)
-    if msg_rows:
-        db.add_all(msg_rows)
 
     db.commit()
     try:
@@ -5513,7 +5513,7 @@ def realtime_events_batch(
             background_tasks.add_task(punctuate_realtime_events, org, punct_ids)
     except Exception:
         pass
-    return {"inserted_events": len(ev_rows), "inserted_messages": len(msg_rows)}
+    return {"inserted_events": len(ev_rows), "inserted_messages": 0}
 
 
 @app.post("/api/realtime/end")
@@ -5826,6 +5826,42 @@ def _build_executive_report_from_realtime_events(
     events: List[RealtimeEvent],
 ) -> str:
     """Build a summit-friendly executive report from persisted realtime events."""
+    def _event_meta(ev: RealtimeEvent) -> Dict[str, Any]:
+        try:
+            return json.loads(getattr(ev, "meta", None) or "{}")
+        except Exception:
+            return {}
+
+    def _speaker_from_event(ev: RealtimeEvent, role: str) -> str:
+        meta = _event_meta(ev)
+        candidates = []
+        if role == "user":
+            candidates.extend([
+                meta.get("user_name"),
+                getattr(rs, "user_name", None),
+                "User",
+            ])
+        else:
+            candidates.extend([
+                meta.get("speaker"),
+                meta.get("speaker_name"),
+                meta.get("agent_name"),
+                getattr(ev, "agent_name", None),
+                getattr(rs, "agent_name", None),
+                "Orkio",
+            ])
+        for candidate in candidates:
+            name = _normalize_report_text(candidate)
+            if not name:
+                continue
+            lowered = name.lower()
+            if lowered in {"assistant", "agent", "model"}:
+                return "Orkio"
+            if lowered == "user":
+                return "User"
+            return name
+        return "User" if role == "user" else "Orkio"
+
     cleaned = []
     for ev in events:
         role = ((getattr(ev, "role", None) or "").strip().lower())
@@ -5835,11 +5871,11 @@ def _build_executive_report_from_realtime_events(
         if event_type and not event_type.endswith(".final"):
             continue
 
-        body = _normalize_report_text(getattr(ev, "transcript_punct", None) or getattr(ev, "content", None))
+        body = _normalize_report_text(getattr(ev, "transcript_punct", None) or getattr(ev, "transcript_raw", None) or getattr(ev, "content", None))
         if _looks_like_noise(body):
             continue
 
-        speaker = "User" if role == "user" else (_normalize_report_text(getattr(ev, "agent_name", None)) or "Orkio")
+        speaker = _speaker_from_event(ev, "user" if role == "user" else "assistant")
         cleaned.append({
             "speaker": speaker,
             "role": "user" if role == "user" else "assistant",
@@ -5994,16 +6030,29 @@ def realtime_get_session_ata(
     if user.get("role") != "admin":
         _require_thread_member(db, org, rs.thread_id, uid)
 
-    msgs = db.execute(
-        select(Message)
+    events = db.execute(
+        select(RealtimeEvent)
         .where(
-            Message.org_slug == org,
-            Message.thread_id == rs.thread_id,
+            RealtimeEvent.org_slug == org,
+            RealtimeEvent.session_id == rs.id,
         )
-        .order_by(Message.created_at.asc(), Message.id.asc())
+        .order_by(RealtimeEvent.created_at.asc(), RealtimeEvent.id.asc())
     ).scalars().all()
 
-    payload = _build_executive_report_from_messages(org, rs, msgs).strip() + "\n"
+    if events:
+        # RealtimeEvent is the primary source-of-truth for ATA export.
+        payload = _build_executive_report_from_realtime_events(org, rs, events).strip() + "\n"
+    else:
+        # Fallback only when the realtime audit trail is empty/unavailable.
+        msgs = db.execute(
+            select(Message)
+            .where(
+                Message.org_slug == org,
+                Message.thread_id == rs.thread_id,
+            )
+            .order_by(Message.created_at.asc(), Message.id.asc())
+        ).scalars().all()
+        payload = _build_executive_report_from_messages(org, rs, msgs).strip() + "\n"
     filename = f"orkio-ata-{rs.id}.txt"
     return Response(
         content=payload.encode("utf-8"),
@@ -6129,15 +6178,14 @@ def otp_verify(inp: OtpVerifyIn, request: Request = None, db: Session = Depends(
     except Exception:
         pass
 
-    user_payload = _serialize_user_payload(u, usage_tier)
-    if not _is_user_approved(u):
-        return {"pending_approval": True, "message": "Identidade validada. Seu acesso ainda depende de aprovação manual.", "user": user_payload}
-
-    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier})
+    response = _build_auth_response(u, org, usage_tier)
+    if response.get("pending_approval"):
+        response["message"] = "Identidade validada. Seu acesso ainda depende de aprovação manual."
+        return response
 
     _create_user_session(db, u.id, org, ip, getattr(u, "signup_code_label", None), usage_tier)
 
-    return {"access_token": token, "token_type": "bearer", "user": user_payload}
+    return response
 @app.post("/api/auth/login/verify-otp")
 def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = Depends(get_db)):
     """Verify OTP code (issued after password login) and return JWT token."""
@@ -6191,15 +6239,14 @@ def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = De
     except Exception:
         pass
 
-    user_payload = _serialize_user_payload(u, usage_tier)
-    if not _is_user_approved(u):
-        return {"pending_approval": True, "message": "Identidade validada. Seu acesso ainda depende de aprovação manual.", "user": user_payload}
-
-    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier})
+    response = _build_auth_response(u, org, usage_tier)
+    if response.get("pending_approval"):
+        response["message"] = "Identidade validada. Seu acesso ainda depende de aprovação manual."
+        return response
 
     _create_user_session(db, u.id, org, ip, getattr(u, "signup_code_label", None), usage_tier)
 
-    return {"access_token": token, "token_type": "bearer", "user": user_payload}
+    return response
 
 
 # ── Contact / LGPD endpoints ──────────────────────────────────────────
