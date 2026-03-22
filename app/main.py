@@ -1183,6 +1183,110 @@ def _send_password_reset_email(to_email: str, reset_token: str) -> bool:
     )
     return _send_resend_email(to_email, subject, text_body)
 
+
+def _approval_email_login_url() -> str:
+    return (
+        _clean_env(os.getenv("ORKIO_WEB_URL", ""), default="").rstrip("/")
+        or _clean_env(os.getenv("APP_BASE_URL", ""), default="").rstrip("/")
+        or _clean_env(os.getenv("PUBLIC_APP_URL", ""), default="").rstrip("/")
+        or "https://web-production-e0b5.up.railway.app"
+    )
+
+def _extract_first_name(name: Optional[str]) -> str:
+    raw = re.sub(r"\s+", " ", (name or "").strip())
+    if not raw:
+        return ""
+    return raw.split(" ")[0].strip()
+
+def _pt_welcome_suffix_from_name(name: Optional[str]) -> str:
+    """
+    Conservative gender guess for PT-BR greeting.
+    Returns:
+      "a" -> bem-vinda
+      "o" -> bem-vindo
+      "(a)" -> fallback neutro when uncertain
+    """
+    first = _extract_first_name(name).lower()
+    if not first:
+        return "(a)"
+
+    feminine_known = {
+        "ana","maria","juliana","mariana","patricia","fernanda","amanda","camila","gabriela",
+        "beatriz","larissa","leticia","jessica","bruna","carolina","priscila","renata","luana",
+        "aline","elaine","clarissa","isabela","isabella","sophia","sofia","victoria","vitoria",
+        "bianca","monica","claudia","paula","adriana","vanessa","simone","daniela"
+    }
+    masculine_known = {
+        "daniel","gabriel","samuel","miguel","rafael","emanuel","joao","pedro","lucas","mateus",
+        "matheus","thiago","rodrigo","felipe","marcos","bruno","carlos","eduardo","andre","andré",
+        "renato","gustavo","leonardo","vinicius","vinícius","caio","sergio","sérgio","fabio","fábio",
+        "henrique","maicon","mauricio","maurício","otavio","otávio","enzo","arthur","arthur","orfeu"
+    }
+
+    if first in feminine_known:
+        return "a"
+    if first in masculine_known:
+        return "o"
+
+    if first.endswith("a") and first not in {"luca", "joshua", "nikita"}:
+        return "a"
+    if first.endswith(("o", "el", "il", "im", "or", "ur", "er", "os", "es")):
+        return "o"
+
+    return "(a)"
+
+def _build_approval_email_text(user_name: Optional[str]) -> str:
+    first = _extract_first_name(user_name) or "você"
+    suffix = _pt_welcome_suffix_from_name(user_name)
+    url = _approval_email_login_url()
+    return (
+        f"Olá {first},\n\n"
+        f"Seja muito bem-vind{suffix} ao Orkio.\n\n"
+        "Sua conta foi aprovada e sua experiência já está liberada.\n"
+        "No seu próximo acesso, eu vou conduzir rapidamente o seu onboarding para personalizar a plataforma ao seu perfil e aos seus objetivos.\n\n"
+        "Acesse por aqui:\n"
+        f"{url}/\n\n"
+        "Será um prazer seguir com você por lá.\n\n"
+        "Equipe Orkio"
+    )
+
+def _build_approval_email_html(user_name: Optional[str]) -> str:
+    first = _extract_first_name(user_name) or "você"
+    suffix = _pt_welcome_suffix_from_name(user_name)
+    url = _approval_email_login_url()
+    return f"""
+    <div style="margin:0;padding:0;background:#f5f7fb;font-family:Arial,Helvetica,sans-serif;color:#101828;">
+      <div style="max-width:640px;margin:0 auto;padding:32px 20px;">
+        <div style="background:#ffffff;border-radius:20px;padding:32px;border:1px solid #e5e7eb;box-shadow:0 10px 30px rgba(16,24,40,0.08);">
+          <div style="margin-bottom:20px;font-size:28px;font-weight:700;letter-spacing:-0.02em;">Orkio</div>
+          <p style="margin:0 0 16px 0;font-size:16px;line-height:1.6;">Olá {first},</p>
+          <p style="margin:0 0 16px 0;font-size:16px;line-height:1.6;">Seja muito bem-vind{suffix} ao Orkio.</p>
+          <p style="margin:0 0 16px 0;font-size:16px;line-height:1.6;">
+            Sua conta foi aprovada e sua experiência já está liberada.
+            No seu próximo acesso, eu vou conduzir rapidamente o seu onboarding para personalizar a plataforma ao seu perfil e aos seus objetivos.
+          </p>
+          <div style="margin:28px 0;">
+            <a href="{url}/" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:14px 22px;border-radius:12px;font-size:15px;font-weight:600;">
+              Acessar o Orkio
+            </a>
+          </div>
+          <p style="margin:0 0 12px 0;font-size:15px;line-height:1.6;">
+            Ou, se preferir, copie este link no navegador:<br>
+            <span style="color:#475467;">{url}/</span>
+          </p>
+          <p style="margin:24px 0 0 0;font-size:15px;line-height:1.6;">Será um prazer seguir com você por lá.</p>
+          <p style="margin:20px 0 0 0;font-size:15px;line-height:1.6;">Equipe Orkio</p>
+        </div>
+      </div>
+    </div>
+    """
+
+def _send_approval_email(to_email: str, user_name: Optional[str]) -> bool:
+    subject = "Seu acesso ao Orkio foi aprovado"
+    text_body = _build_approval_email_text(user_name)
+    html_body = _build_approval_email_html(user_name)
+    return _send_resend_email(to_email, subject, text_body, html_body=html_body)
+
 def _score_founder_opportunity(email: str, interest_type: str, message: str) -> int:
     score = 0
     msg = (message or "").lower()
@@ -3695,6 +3799,7 @@ def admin_users(status: str = "all", _admin=Depends(require_admin_access), x_org
 @app.post("/api/admin/users/{user_id}/approve")
 def admin_approve_user(
     user_id: str,
+    background_tasks: BackgroundTasks,
     _admin=Depends(require_admin_access),
     x_org_slug: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
@@ -3704,17 +3809,14 @@ def admin_approve_user(
     u = db.execute(select(User).where(User.id == user_id, User.org_slug == org)).scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
-    u.approved_at = now_ts()
-    db.add(u)
-    db.commit()
+    if not getattr(u, "approved_at", None):
+        u.approved_at = now_ts()
+        db.add(u)
+        db.commit()
     try:
-        _send_resend_email(
-            to_email=u.email,
-            subject="Sua conta Orkio foi aprovada",
-            text_body=f"Olá {u.name or 'usuário'}, sua conta foi aprovada. Faça login novamente para continuar e concluir seu onboarding no Orkio.",
-        )
+        background_tasks.add_task(_send_approval_email, u.email, u.name)
     except Exception:
-        logger.exception("APPROVAL_EMAIL_FAILED user_id=%s email=%s", getattr(u, "id", None), getattr(u, "email", None))
+        logger.exception("APPROVAL_EMAIL_SCHEDULE_FAILED user_id=%s email=%s", getattr(u, "id", None), getattr(u, "email", None))
     try:
         audit(
             db=db,
