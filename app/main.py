@@ -8,7 +8,7 @@ import asyncio
 import jwt
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File as UpFile, Request, Form, BackgroundTasks, Query
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File as UpFile, Request, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
@@ -802,6 +802,142 @@ Typical response length: 2–4 short paragraphs or a structured technical analys
         is_default=False,
     )
 
+
+
+@app.get("/api/auth/validate-access-code")
+def validate_access_code(
+    code: str,
+    email: Optional[str] = None,
+    tenant: Optional[str] = None,
+    x_org_slug: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    org = (get_org(x_org_slug) if x_org_slug else (tenant or default_tenant())).strip()
+    sc = _validate_access_code_no_consume(db, org, code)
+    if not sc:
+        raise HTTPException(status_code=403, detail="Invalid, expired or exhausted access code.")
+    return {
+        "ok": True,
+        "valid": True,
+        "label": sc.label,
+        "source": sc.source,
+        "org": org,
+    }
+
+
+class SummitSessionStartCompatIn(BaseModel):
+    language: Optional[str] = "auto"
+    mode: Optional[str] = "realtime"
+    thread_id: Optional[str] = None
+    agent_id: Optional[str] = None
+
+
+@app.post("/api/summit/sessions/start")
+def summit_sessions_start_compat(
+    inp: SummitSessionStartCompatIn,
+    x_org_slug: Optional[str] = Header(default=None),
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    org = _resolve_org(user, x_org_slug)
+
+    session = RealtimeSession(
+        id=new_id(),
+        org_slug=org,
+        thread_id=inp.thread_id,
+        started_by=user.get("sub"),
+        started_at=now_ts(),
+        ended_at=None,
+        summary_exec=None,
+        minutes=None,
+        status="active",
+    )
+    db.add(session)
+    db.commit()
+
+    return {
+        "ok": True,
+        "session_id": session.id,
+        "status": session.status,
+        "language": inp.language or "auto",
+        "mode": inp.mode or "realtime",
+    }
+
+
+@app.post("/api/audio/transcriptions")
+async def audio_transcriptions_compat(
+    file: UploadFile = UpFile(...),
+    language: Optional[str] = Form(default=None),
+    x_org_slug: Optional[str] = Header(default=None),
+    x_trace_id: Optional[str] = Header(default=None),
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Compat route for frontend calling /api/audio/transcriptions.
+    Delegates to the same logic used by /api/stt.
+    """
+    trace_id = x_trace_id or new_id()
+    org = _resolve_org(user, x_org_slug)
+
+    allowed_types = {
+        "audio/webm", "audio/mpeg", "audio/mp3", "audio/wav",
+        "audio/ogg", "audio/m4a", "audio/mp4", "video/webm"
+    }
+    ct = (file.content_type or "").lower()
+    fname = (file.filename or "audio.webm").lower()
+
+    if ct and ct not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Unsupported content type: {ct}")
+
+    import tempfile
+    tmp_suffix = os.path.splitext(fname)[1] or ".webm"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=tmp_suffix) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        requested_language = None if not language or language == "auto" else language
+
+        with open(tmp_path, "rb") as audio_file:
+            transcribe_kwargs = {
+                "model": os.getenv("OPENAI_STT_MODEL", "whisper-1").strip() or "whisper-1",
+                "file": audio_file,
+            }
+            if requested_language:
+                transcribe_kwargs["language"] = requested_language
+            transcript = client.audio.transcriptions.create(**transcribe_kwargs)
+
+        raw_text = (transcript.text or "").strip()
+        text = _normalize_stt_text(raw_text)
+
+        logger.info(
+            "v2v_stt_ok trace_id=%s org=%s chars=%d preview=%r",
+            trace_id, org, len(text), text[:60],
+        )
+
+        return {
+            "text": text,
+            "raw_text": raw_text,
+            "language": (requested_language or "auto"),
+            "trace_id": trace_id,
+        }
+
+    except Exception as e:
+        logger.exception("v2v_stt_fail trace_id=%s error=%s", trace_id, str(e))
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
 class RegisterIn(BaseModel):
     tenant: str = Field(default_tenant(), min_length=1)
     email: EmailStr
@@ -1377,144 +1513,6 @@ def _validate_access_code_no_consume(db: Session, org: str, code: str) -> Option
     if max_uses > 0 and current_used >= max_uses:
         return None
     return sc
-
-
-@app.get("/api/auth/validate-access-code")
-def validate_access_code(
-    code: str = Query(...),
-    email: Optional[str] = Query(default=None),
-    tenant: Optional[str] = Query(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    org = (get_org(x_org_slug) if x_org_slug else (tenant or default_tenant())).strip()
-    sc = _validate_access_code_no_consume(db, org, code)
-    if not sc:
-        raise HTTPException(status_code=403, detail="Invalid, expired or exhausted access code.")
-    return {
-        "ok": True,
-        "valid": True,
-        "label": sc.label,
-        "source": sc.source,
-        "org": org,
-        "email": email,
-    }
-
-
-class SummitSessionStartCompatIn(BaseModel):
-    language: Optional[str] = "auto"
-    mode: Optional[str] = "realtime"
-    thread_id: Optional[str] = None
-    agent_id: Optional[str] = None
-
-
-@app.post("/api/summit/sessions/start")
-def summit_sessions_start_compat(
-    inp: SummitSessionStartCompatIn,
-    x_org_slug: Optional[str] = Header(default=None),
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    org = _resolve_org(user, x_org_slug)
-
-    session = RealtimeSession(
-        id=new_id(),
-        org_slug=org,
-        thread_id=inp.thread_id,
-        started_by=user.get("sub"),
-        started_at=now_ts(),
-        ended_at=None,
-        summary_exec=None,
-        minutes=None,
-        status="active",
-    )
-    db.add(session)
-    db.commit()
-
-    return {
-        "ok": True,
-        "session_id": session.id,
-        "status": session.status,
-        "language": inp.language or "auto",
-        "mode": inp.mode or "realtime",
-        "thread_id": inp.thread_id,
-        "agent_id": inp.agent_id,
-    }
-
-
-@app.post("/api/audio/transcriptions")
-async def audio_transcriptions_compat(
-    file: UploadFile = UpFile(...),
-    language: Optional[str] = Form(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    x_trace_id: Optional[str] = Header(default=None),
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Compatibility route for frontend calling /api/audio/transcriptions.
-    Delegates to the same logic used by /api/stt.
-    """
-    trace_id = x_trace_id or new_id()
-    org = _resolve_org(user, x_org_slug)
-
-    allowed_types = {
-        "audio/webm", "audio/mpeg", "audio/mp3", "audio/wav",
-        "audio/ogg", "audio/m4a", "audio/mp4", "video/webm"
-    }
-    ct = (file.content_type or "").lower()
-    fname = (file.filename or "audio.webm").lower()
-
-    if ct and ct not in allowed_types:
-        raise HTTPException(status_code=400, detail=f"Unsupported content type: {ct}")
-
-    import tempfile
-    tmp_suffix = os.path.splitext(fname)[1] or ".webm"
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=tmp_suffix) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
-
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        requested_language = None if not language or language == "auto" else language
-
-        with open(tmp_path, "rb") as audio_file:
-            transcribe_kwargs = {
-                "model": os.getenv("OPENAI_STT_MODEL", "whisper-1").strip() or "whisper-1",
-                "file": audio_file,
-            }
-            if requested_language:
-                transcribe_kwargs["language"] = requested_language
-            transcript = client.audio.transcriptions.create(**transcribe_kwargs)
-
-        raw_text = (transcript.text or "").strip()
-        text = _normalize_stt_text(raw_text)
-
-        logger.info(
-            "v2v_stt_ok trace_id=%s org=%s chars=%d preview=%r",
-            trace_id, org, len(text), text[:60],
-        )
-
-        return {
-            "text": text,
-            "raw_text": raw_text,
-            "language": (requested_language or "auto"),
-            "trace_id": trace_id,
-        }
-
-    except Exception as e:
-        logger.exception("v2v_stt_fail trace_id=%s error=%s", trace_id, str(e))
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-
 
 def get_current_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
