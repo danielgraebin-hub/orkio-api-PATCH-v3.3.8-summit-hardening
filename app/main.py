@@ -1811,11 +1811,12 @@ async def audio_transcriptions_compat(
         "audio/webm", "audio/mpeg", "audio/mp3", "audio/wav",
         "audio/ogg", "audio/m4a", "audio/mp4", "video/webm"
     }
-    ct = (file.content_type or "").lower()
+    raw_ct = (file.content_type or "").lower()
+    ct = raw_ct.split(";", 1)[0].strip()
     fname = (file.filename or "audio.webm").lower()
 
     if ct and ct not in allowed_types:
-        raise HTTPException(status_code=400, detail=f"Unsupported content type: {ct}")
+        raise HTTPException(status_code=400, detail=f"Unsupported content type: {raw_ct}")
 
     import tempfile
     tmp_suffix = os.path.splitext(fname)[1] or ".webm"
@@ -2658,8 +2659,10 @@ def login(inp: LoginIn, x_org_slug: Optional[str] = Header(default=None), db: Se
             ))
             db.commit()
 
-            # Send email (best-effort)
-            _send_otp_email(email, otp_plain)
+            # Send email (fail-closed by default so the UI does not ask for a code that was never delivered)
+            sent = _send_otp_email(email, otp_plain)
+            if not sent and os.getenv("SUMMIT_OTP_FAIL_OPEN", "false").lower() not in ("1", "true", "yes"):
+                raise HTTPException(status_code=500, detail="Falha ao enviar código de verificação. Tente novamente.")
 
             try:
                 audit(db, org, u.id, "login.otp_issued", request_id="login", path="/api/auth/login",
@@ -6468,8 +6471,10 @@ def otp_request(inp: OtpRequestIn, request: Request = None, db: Session = Depend
     ))
     db.commit()
 
-    # Send email (best-effort)
-    _send_otp_email(email, otp_plain)
+    # Send email (fail-closed by default so the UI does not claim the code was sent when it was not)
+    sent = _send_otp_email(email, otp_plain)
+    if not sent and os.getenv("SUMMIT_OTP_FAIL_OPEN", "false").lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=500, detail="Falha ao enviar código de verificação. Tente novamente.")
 
     try:
         audit(db, org, u.id, "otp.requested", request_id="otp", path="/api/auth/otp/request",
