@@ -26,6 +26,9 @@ class User(Base):
     user_type = Column(String, nullable=True)
     intent = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
+    country = Column(String, nullable=True)
+    language = Column(String, nullable=True)
+    whatsapp = Column(String, nullable=True)
     onboarding_completed = Column(Boolean, nullable=False, default=False)
 
 class Thread(Base):
