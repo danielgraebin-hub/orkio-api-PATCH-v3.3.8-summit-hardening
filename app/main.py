@@ -501,8 +501,20 @@ def _serialize_user_payload(u: User, usage_tier: Optional[str] = None) -> Dict[s
 def _auth_status_for_user(u: Optional[User]) -> str:
     if not u:
         return "invalid_credentials"
-    if not _is_user_approved(u):
+
+    usage_tier = ((getattr(u, "usage_tier", None) or "")).strip().lower()
+    signup_source = ((getattr(u, "signup_source", None) or "")).strip().lower()
+    signup_code_label = ((getattr(u, "signup_code_label", None) or "")).strip().lower()
+
+    summit_auto_approved = (
+        usage_tier.startswith("summit_")
+        or signup_source == "investor"
+        or signup_code_label == "efata777"
+    )
+
+    if not summit_auto_approved and not _is_user_approved(u):
         return "pending_approval"
+
     if bool(getattr(u, "onboarding_completed", False)):
         return "approved_ready"
     return "approved_onboarding_pending"
@@ -529,6 +541,8 @@ def _build_auth_response(u: User, org: str, usage_tier: Optional[str], *, ip: Op
         "role": u.role,
         "approved_at": getattr(u, "approved_at", None),
         "usage_tier": usage_tier,
+        "signup_source": getattr(u, "signup_source", None),
+        "signup_code_label": getattr(u, "signup_code_label", None),
         "onboarding_completed": onboarding_completed,
     }
     payload["access_token"] = mint_token(token_payload)
