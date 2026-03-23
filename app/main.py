@@ -481,17 +481,21 @@ def _is_user_approved(u: Optional[User]) -> bool:
 def _serialize_user_payload(u: User, usage_tier: Optional[str] = None) -> Dict[str, Any]:
     return {
         "id": u.id,
+        "org_slug": getattr(u, "org_slug", None),
         "email": u.email,
         "name": u.name,
         "role": u.role,
         "approved_at": getattr(u, "approved_at", None),
         "usage_tier": usage_tier or getattr(u, "usage_tier", None),
+        "signup_code_label": getattr(u, "signup_code_label", None),
+        "signup_source": getattr(u, "signup_source", None),
         "company": getattr(u, "company", None),
         "profile_role": getattr(u, "profile_role", None),
         "user_type": getattr(u, "user_type", None),
         "intent": getattr(u, "intent", None),
         "notes": getattr(u, "notes", None),
         "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
+        "terms_accepted_at": getattr(u, "terms_accepted_at", None),
     }
 
 def _auth_status_for_user(u: Optional[User]) -> str:
@@ -2520,8 +2524,11 @@ def _get_feature_flag(db: Session, org: str, key: str) -> Optional[str]:
         return None
 
 
-
 def _is_summit_auto_approved_code(raw_access_code: Optional[str], signup_code_label: Optional[str], signup_source: Optional[str]) -> bool:
+    """
+    Summit access code EFATA777 must auto-approve without manual admin approval.
+    Compatible with legacy states where the signal may live in label/source.
+    """
     raw = (raw_access_code or "").strip().lower()
     label = (signup_code_label or "").strip().lower()
     source = (signup_source or "").strip().lower()
@@ -2533,7 +2540,6 @@ def _is_summit_auto_approved_code(raw_access_code: Optional[str], signup_code_la
         return True
     return False
 
-
 @app.post("/api/auth/register", response_model=TokenOut)
 def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
     ip = (request.client.host if request and request.client else "unknown")
@@ -2541,94 +2547,140 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     email = inp.email.lower().strip()
     is_admin_email = email in admin_emails()
 
-    # PATCH0100_28: Rate limit registration
     if not _rate_limit_check(_rl_register_lock, _rl_register_calls, ip, _REGISTER_MAX_PER_MINUTE):
         raise HTTPException(status_code=429, detail="Muitas tentativas de registro. Aguarde 1 minuto.")
 
-    # PATCH0100_28: Access code validation (Summit mode)
     signup_code_label = None
     signup_source = None
     usage_tier = "summit_standard"
+
     if SUMMIT_MODE and not is_admin_email:
         if not inp.access_code:
             logger.warning("REGISTER_DENIED reason=missing_code ip=%s org=%s", ip, org)
             raise HTTPException(status_code=403, detail="Access code is required in Summit mode.")
+
         sc = _validate_access_code(db, org, inp.access_code)
         if not sc:
             logger.warning("REGISTER_DENIED reason=invalid_code ip=%s org=%s", ip, org)
             raise HTTPException(status_code=403, detail="Invalid, expired or exhausted access code.")
+
         signup_code_label = sc.label
         signup_source = sc.source
+
         if now_ts() > int(SUMMIT_EXPIRES_AT):
             raise HTTPException(status_code=403, detail="Summit access window has ended.")
+
         normalized_signup_source = (sc.source or "").strip().lower()
-        if normalized_signup_source == "investor":
+        normalized_signup_label = (sc.label or "").strip().lower()
+        normalized_input_code = (inp.access_code or "").strip().lower()
+
+        if normalized_signup_source == "investor" or normalized_signup_label == "efata777" or normalized_input_code == "efata777":
             usage_tier = "summit_vip"
         elif normalized_signup_source == "summit_user":
             usage_tier = "summit_standard"
 
     elif inp.access_code:
-        # Non-summit mode but code provided — validate if exists
         sc = _validate_access_code(db, org, inp.access_code)
         if sc:
             signup_code_label = sc.label
             signup_source = sc.source
 
-    # PATCH0100_28: Terms acceptance
     if SUMMIT_MODE and not inp.accept_terms:
         logger.warning("REGISTER_DENIED reason=terms_not_accepted ip=%s org=%s", ip, org)
         raise HTTPException(status_code=400, detail="Você precisa aceitar os Termos de Uso para continuar.")
 
-    # auto-admin
-    is_admin_email = email in admin_emails()
     role = "admin" if is_admin_email else "user"
 
     existing = db.execute(select(User).where(User.org_slug == org, User.email == email)).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
+    auto_approved_by_code = _is_summit_auto_approved_code(inp.access_code, signup_code_label, signup_source)
+    approved_at_value = now_ts() if (is_admin_email or auto_approved_by_code) else None
+
     salt = new_salt()
     pw_hash = pbkdf2_hash(inp.password, salt)
+
     u = User(
-        id=new_id(), org_slug=org, email=email, name=inp.name.strip(),
-        role=role, salt=salt, pw_hash=pw_hash, created_at=now_ts(),
-        approved_at=(now_ts() if is_admin_email else None),
-        signup_code_label=signup_code_label, signup_source=signup_source,
+        id=new_id(),
+        org_slug=org,
+        email=email,
+        name=inp.name.strip(),
+        role=role,
+        salt=salt,
+        pw_hash=pw_hash,
+        created_at=now_ts(),
+        approved_at=approved_at_value,
+        signup_code_label=signup_code_label,
+        signup_source=signup_source,
         usage_tier=usage_tier,
         terms_accepted_at=(now_ts() if inp.accept_terms else None),
         terms_version=(TERMS_VERSION if inp.accept_terms else None),
         marketing_consent=inp.marketing_consent,
         onboarding_completed=False,
     )
+
+    try:
+        if auto_approved_by_code and hasattr(u, "approved_via"):
+            setattr(u, "approved_via", "access_code")
+        if auto_approved_by_code and hasattr(u, "access_code_used"):
+            setattr(u, "access_code_used", (inp.access_code or "").strip().upper())
+        if auto_approved_by_code and hasattr(u, "status"):
+            setattr(u, "status", "active")
+    except Exception:
+        logger.exception("REGISTER_AUTO_APPROVAL_METADATA_FAILED email=%s", email)
+
     db.add(u)
     db.commit()
 
-    # Record terms acceptance
     if inp.accept_terms:
         try:
             db.add(TermsAcceptance(
-                id=new_id(), user_id=u.id, terms_version=TERMS_VERSION,
-                accepted_at=now_ts(), ip_address=ip,
+                id=new_id(),
+                user_id=u.id,
+                terms_version=TERMS_VERSION,
+                accepted_at=now_ts(),
+                ip_address=ip,
                 user_agent=(request.headers.get("user-agent", "") if request else None),
             ))
             db.commit()
         except Exception:
             logger.exception("TERMS_ACCEPTANCE_RECORD_FAILED")
 
-    # Record marketing consent
     if inp.marketing_consent:
         try:
             db.add(MarketingConsent(
-                id=new_id(), user_id=u.id, channel="email",
-                opt_in_date=now_ts(), ip=ip, source="register", created_at=now_ts(),
+                id=new_id(),
+                user_id=u.id,
+                channel="email",
+                opt_in_date=now_ts(),
+                ip=ip,
+                source="register",
+                created_at=now_ts(),
             ))
             db.commit()
         except Exception:
             logger.exception("MARKETING_CONSENT_RECORD_FAILED")
 
     try:
-        audit(db, org, u.id, "user.register", request_id="reg", path="/api/auth/register", status_code=200, latency_ms=0,
-              meta={"email": u.email, "signup_code_label": signup_code_label, "signup_source": signup_source, "usage_tier": usage_tier, "summit_mode": SUMMIT_MODE})
+        audit(
+            db,
+            org,
+            u.id,
+            "user.register",
+            request_id="reg",
+            path="/api/auth/register",
+            status_code=200,
+            latency_ms=0,
+            meta={
+                "email": u.email,
+                "signup_code_label": signup_code_label,
+                "signup_source": signup_source,
+                "usage_tier": usage_tier,
+                "summit_mode": SUMMIT_MODE,
+                "auto_approved_by_code": auto_approved_by_code,
+            },
+        )
     except Exception:
         pass
 
@@ -2640,13 +2692,15 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
         logger.exception("ADMIN_SYNC_FAILED register user_id=%s", getattr(u, "id", None))
 
     response = _build_auth_response(u, org, usage_tier)
+
     if response.get("pending_approval"):
         response["message"] = "Conta criada com sucesso. Sua identidade será verificada por OTP no login e o acesso ao app será liberado após aprovação manual."
         return response
 
-    # Create user session for presence tracking
     _create_user_session(db, u.id, org, ip, signup_code_label, usage_tier)
-
+    response["message"] = "Conta criada com sucesso."
+    response["authenticated"] = True
+    response["redirect_to"] = "/app"
     return response
 
 @app.post("/api/auth/login")
@@ -6622,7 +6676,7 @@ def otp_verify(inp: OtpVerifyIn, request: Request = None, db: Session = Depends(
     return response
 @app.post("/api/auth/login/verify-otp")
 def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = Depends(get_db)):
-    """Verify OTP code (issued after password login) and return JWT token."""
+    """Verify OTP code and create the final Summit session immediately."""
     ip = (request.client.host if request and request.client else "unknown")
     if not _rate_limit_check(_rl_otp_lock, _rl_otp_calls, ip, _OTP_MAX_PER_MINUTE):
         raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde 1 minuto.")
@@ -6633,7 +6687,6 @@ def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = De
     if not u:
         raise HTTPException(status_code=401, detail="Código inválido ou expirado.")
 
-    # Summit access window enforcement (standard users only)
     usage_tier = getattr(u, "usage_tier", "summit_standard") or "summit_standard"
     if _summit_access_expired({"role": u.role, "usage_tier": usage_tier}):
         raise HTTPException(status_code=403, detail="Acesso ao Summit encerrado.")
@@ -6649,7 +6702,6 @@ def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = De
     ).scalar_one_or_none()
 
     if not otp:
-        # Increment attempts on latest OTP
         latest = db.execute(
             select(OtpCode).where(OtpCode.user_id == u.id, OtpCode.verified == False)
             .order_by(OtpCode.created_at.desc()).limit(1)
@@ -6657,29 +6709,52 @@ def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = De
         if latest:
             latest.attempts = (latest.attempts or 0) + 1
             if latest.attempts >= 5:
-                latest.verified = True  # Lock out
+                latest.verified = True
             db.add(latest)
             db.commit()
         raise HTTPException(status_code=401, detail="Código inválido ou expirado.")
 
-    # Mark as verified
     otp.verified = True
     db.add(otp)
+
+    try:
+        if hasattr(u, "last_otp_verified_at"):
+            setattr(u, "last_otp_verified_at", now_ts())
+        if hasattr(u, "first_login_completed_at") and getattr(u, "first_login_completed_at", None) is None:
+            setattr(u, "first_login_completed_at", now_ts())
+        db.add(u)
+    except Exception:
+        logger.exception("OTP_USER_METADATA_UPDATE_FAILED user_id=%s", getattr(u, "id", None))
+
     db.commit()
 
     try:
-        audit(db, org, u.id, "login.otp_verified", request_id="login", path="/api/auth/login/verify-otp",
-              status_code=200, latency_ms=0, meta={"email": email, "summit_mode": SUMMIT_MODE})
+        audit(
+            db,
+            org,
+            u.id,
+            "login.otp_verified",
+            request_id="login",
+            path="/api/auth/login/verify-otp",
+            status_code=200,
+            latency_ms=0,
+            meta={"email": email, "summit_mode": SUMMIT_MODE},
+        )
     except Exception:
         pass
+
+    _create_user_session(db, u.id, org, ip, getattr(u, "signup_code_label", None), usage_tier)
 
     response = _build_auth_response(u, org, usage_tier)
     if response.get("pending_approval"):
         response["message"] = "Identidade validada. Seu acesso ainda depende de aprovação manual."
+        response["authenticated"] = False
+        response["redirect_to"] = None
         return response
 
-    _create_user_session(db, u.id, org, ip, getattr(u, "signup_code_label", None), usage_tier)
-
+    response["authenticated"] = True
+    response["redirect_to"] = "/app"
+    response["message"] = "Acesso validado com sucesso."
     return response
 
 
