@@ -494,6 +494,9 @@ def _serialize_user_payload(u: User, usage_tier: Optional[str] = None) -> Dict[s
         "user_type": getattr(u, "user_type", None),
         "intent": getattr(u, "intent", None),
         "notes": getattr(u, "notes", None),
+        "country": getattr(u, "country", None),
+        "language": getattr(u, "language", None),
+        "whatsapp": getattr(u, "whatsapp", None),
         "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
         "terms_accepted_at": getattr(u, "terms_accepted_at", None),
     }
@@ -502,17 +505,17 @@ def _auth_status_for_user(u: Optional[User]) -> str:
     if not u:
         return "invalid_credentials"
 
-    usage_tier = ((getattr(u, "usage_tier", None) or "")).strip().lower()
-    signup_source = ((getattr(u, "signup_source", None) or "")).strip().lower()
-    signup_code_label = ((getattr(u, "signup_code_label", None) or "")).strip().lower()
+    usage_tier = (getattr(u, "usage_tier", "") or "").lower()
+    signup_source = (getattr(u, "signup_source", "") or "").lower()
+    signup_code_label = (getattr(u, "signup_code_label", "") or "").lower()
 
-    summit_auto_approved = (
+    summit_eligible = (
         usage_tier.startswith("summit_")
         or signup_source == "investor"
         or signup_code_label == "efata777"
     )
 
-    if not summit_auto_approved and not _is_user_approved(u):
+    if not summit_eligible and not _is_user_approved(u):
         return "pending_approval"
 
     if bool(getattr(u, "onboarding_completed", False)):
@@ -547,6 +550,7 @@ def _build_auth_response(u: User, org: str, usage_tier: Optional[str], *, ip: Op
     }
     payload["access_token"] = mint_token(token_payload)
     payload["token_type"] = "bearer"
+    payload["redirect_to"] = "/app"
     return payload
 
 def enable_streaming() -> bool:
@@ -1026,6 +1030,15 @@ def ensure_schema(db: Session):
     try:
         db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS approved_at BIGINT"))
         db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS role VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS company VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS profile_role VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS user_type VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS intent VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS notes TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS country VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS language VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS whatsapp VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS user_name VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_name VARCHAR"))
@@ -1923,6 +1936,9 @@ class OnboardingPayloadCompat(BaseModel):
     user_type: str
     intent: str
     notes: Optional[str] = None
+    country: Optional[str] = None
+    language: Optional[str] = None
+    whatsapp: Optional[str] = None
     onboarding_completed: bool = True
 
 
@@ -1948,9 +1964,12 @@ def _save_user_onboarding_compat(
     u.user_type = (payload.user_type or "").strip()
     u.intent = (payload.intent or "").strip()
     u.notes = (payload.notes or None)
+    u.country = (payload.country or None)
+    u.language = (payload.language or None)
+    u.whatsapp = (payload.whatsapp or None)
     u.onboarding_completed = bool(payload.onboarding_completed)
 
-    if not u.user_type or not u.intent:
+    if not u.user_type or not u.intent or not u.country or not u.language:
         raise HTTPException(status_code=400, detail="Missing required fields")
 
     db.add(u)
@@ -4188,6 +4207,9 @@ def admin_users(status: str = "all", _admin=Depends(require_admin_access), x_org
         "user_type": getattr(u, "user_type", None),
         "intent": getattr(u, "intent", None),
         "notes": getattr(u, "notes", None),
+        "country": getattr(u, "country", None),
+        "language": getattr(u, "language", None),
+        "whatsapp": getattr(u, "whatsapp", None),
         "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
         "status": "approved" if getattr(u, "approved_at", None) else "pending",
     } for u in rows]
