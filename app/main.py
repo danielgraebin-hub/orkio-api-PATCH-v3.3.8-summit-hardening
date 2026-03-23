@@ -1761,34 +1761,36 @@ class SummitSessionStartCompatIn(BaseModel):
 
 
 @app.post("/api/summit/sessions/start")
-def summit_sessions_start_compat(
+async def summit_sessions_start_compat(
     inp: SummitSessionStartCompatIn,
     x_org_slug: Optional[str] = Header(default=None),
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    org = _resolve_org(user, x_org_slug)
+    """
+    Compatibility alias for legacy/public Summit frontend builds that still call
+    /api/summit/sessions/start.
 
-    session = RealtimeSession(
-        id=new_id(),
-        org_slug=org,
-        thread_id=inp.thread_id,
-        started_at=now_ts(),
-        ended_at=None,
-        summary_exec=None,
-        minutes=None,
-        status="active",
+    Delegates to the canonical /api/realtime/start flow so the response always
+    contains the same structure expected by the frontend, including:
+      - session_id
+      - thread_id
+      - client_secret.value
+      - language / mode metadata
+
+    This avoids drift between old Summit builds and the current realtime runtime.
+    """
+    return await realtime_start(
+        RealtimeStartReq(
+            agent_id=inp.agent_id,
+            thread_id=inp.thread_id,
+            mode=inp.mode or "realtime",
+            language_profile=inp.language or "auto",
+        ),
+        x_org_slug=x_org_slug,
+        user=user,
+        db=db,
     )
-    db.add(session)
-    db.commit()
-
-    return {
-        "ok": True,
-        "session_id": session.id,
-        "status": session.status,
-        "language": inp.language or "auto",
-        "mode": inp.mode or "realtime",
-    }
 
 
 @app.post("/api/audio/transcriptions")
