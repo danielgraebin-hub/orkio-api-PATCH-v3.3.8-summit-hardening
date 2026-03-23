@@ -1773,7 +1773,6 @@ def summit_sessions_start_compat(
         id=new_id(),
         org_slug=org,
         thread_id=inp.thread_id,
-        started_by=user.get("sub"),
         started_at=now_ts(),
         ended_at=None,
         summary_exec=None,
@@ -2416,36 +2415,66 @@ def _create_user_session(db: Session, user_id: str, org: str, ip: str = "unknown
         return None
 
 def _send_otp_email(to_email: str, otp_code: str):
-    """Send OTP code via SMTP. Best-effort, never blocks auth flow."""
-    smtp_host = os.getenv("SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER", "").strip()
-    smtp_pass = os.getenv("SMTP_PASS", "").strip()
-    smtp_from = os.getenv("SMTP_FROM", smtp_user).strip()
+    """Send OTP code via Resend first, then SMTP fallback. Best-effort, never blocks auth flow."""
+    subject = f"Orkio — Seu código de verificação: {otp_code}"
+    text_body = (
+        "Seu código de verificação do Orkio é:\n\n"
+        f"{otp_code}\n\n"
+        "Válido por 10 minutos. Não compartilhe este código."
+    )
+    html = f"""
+    <div style="font-family:system-ui;max-width:480px;margin:0 auto;padding:24px">
+        <h2 style="color:#111">Orkio</h2>
+        <p>Seu código de verificação é:</p>
+        <div style="font-size:32px;font-weight:bold;letter-spacing:8px;padding:16px;background:#f5f5f5;border-radius:8px;text-align:center">{otp_code}</div>
+        <p style="color:#666;font-size:13px;margin-top:16px">Válido por 10 minutos. Não compartilhe este código.</p>
+    </div>
+    """
+
+    # Preferred path: Resend
+    try:
+        if _clean_env(RESEND_API_KEY):
+            ok = _send_resend_email(to_email, subject, text_body, html_body=html)
+            if ok:
+                logger.info("OTP_EMAIL_SENT provider=resend to=%s", to_email)
+                return True
+            logger.warning("OTP_EMAIL_RESEND_FAILED_FALLING_BACK_SMTP to=%s", to_email)
+    except Exception:
+        logger.exception("OTP_EMAIL_RESEND_EXCEPTION to=%s", to_email)
+
+    # Fallback path: SMTP
+    smtp_host = _clean_env(os.getenv("SMTP_HOST", ""), default="")
+    smtp_port_raw = _clean_env(os.getenv("SMTP_PORT", "587"), default="587")
+    smtp_user = _clean_env(os.getenv("SMTP_USER", ""), default="")
+    smtp_pass = _clean_env(os.getenv("SMTP_PASS", ""), default="")
+    smtp_from = _clean_env(os.getenv("SMTP_FROM", smtp_user), default=smtp_user)
+
+    try:
+        smtp_port = int(smtp_port_raw or "587")
+    except Exception:
+        smtp_port = 587
+
     if not smtp_host or not smtp_user:
-        logger.warning("SMTP not configured, OTP email not sent")
+        logger.warning("OTP_EMAIL_SEND_SKIPPED missing_email_provider_config to=%s", to_email)
         return False
+
     try:
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Orkio — Seu c\u00f3digo de verifica\u00e7\u00e3o: {otp_code}"
+        msg["Subject"] = subject
         msg["From"] = smtp_from
         msg["To"] = to_email
-        html = f"""
-        <div style="font-family:system-ui;max-width:480px;margin:0 auto;padding:24px">
-            <h2 style="color:#111">Orkio</h2>
-            <p>Seu c\u00f3digo de verifica\u00e7\u00e3o \u00e9:</p>
-            <div style="font-size:32px;font-weight:bold;letter-spacing:8px;padding:16px;background:#f5f5f5;border-radius:8px;text-align:center">{otp_code}</div>
-            <p style="color:#666;font-size:13px;margin-top:16px">V\u00e1lido por 10 minutos. N\u00e3o compartilhe este c\u00f3digo.</p>
-        </div>
-        """
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
+
         with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as s:
             s.starttls()
             s.login(smtp_user, smtp_pass)
             s.sendmail(smtp_from, [to_email], msg.as_string())
+
+        logger.info("OTP_EMAIL_SENT provider=smtp to=%s", to_email)
         return True
     except Exception:
-        logger.exception("OTP_EMAIL_SEND_FAILED")
+        logger.exception("OTP_EMAIL_SEND_FAILED provider=smtp to=%s", to_email)
         return False
 
 def _get_feature_flag(db: Session, org: str, key: str) -> Optional[str]:
