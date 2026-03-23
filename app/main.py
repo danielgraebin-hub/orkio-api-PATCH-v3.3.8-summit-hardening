@@ -1758,6 +1758,11 @@ class SummitSessionStartCompatIn(BaseModel):
     mode: Optional[str] = "realtime"
     thread_id: Optional[str] = None
     agent_id: Optional[str] = None
+    voice: Optional[str] = None
+    model: Optional[str] = None
+    ttl_seconds: Optional[int] = 600
+    response_profile: Optional[str] = None
+    language_profile: Optional[str] = None
 
 
 @app.post("/api/summit/sessions/start")
@@ -1768,29 +1773,52 @@ async def summit_sessions_start_compat(
     db: Session = Depends(get_db),
 ):
     """
-    Compatibility alias for legacy/public Summit frontend builds that still call
-    /api/summit/sessions/start.
-
-    Delegates to the canonical /api/realtime/start flow so the response always
-    contains the same structure expected by the frontend, including:
-      - session_id
-      - thread_id
-      - client_secret.value
-      - language / mode metadata
-
-    This avoids drift between old Summit builds and the current realtime runtime.
+    Summit compat route -> delega para o fluxo moderno de /api/realtime/start.
+    Isso garante retorno com client_secret.value para o frontend WebRTC atual.
     """
-    return await realtime_start(
-        RealtimeStartReq(
-            agent_id=inp.agent_id,
+    try:
+        resolved_language_profile = (
+            inp.language_profile
+            or inp.language
+            or "auto"
+        )
+
+        rt_req = RealtimeStartReq(
             thread_id=inp.thread_id,
+            agent_id=inp.agent_id,
+            voice=inp.voice,
+            model=inp.model,
+            ttl_seconds=inp.ttl_seconds or 600,
             mode=inp.mode or "realtime",
-            language_profile=inp.language or "auto",
-        ),
-        x_org_slug=x_org_slug,
-        user=user,
-        db=db,
-    )
+            response_profile=inp.response_profile,
+            language_profile=resolved_language_profile,
+        )
+
+        result = await realtime_start(
+            body=rt_req,
+            x_org_slug=x_org_slug,
+            user=user,
+            db=db,
+        )
+
+        if isinstance(result, dict):
+            result.setdefault("ok", True)
+            result.setdefault("language", resolved_language_profile or "auto")
+            result.setdefault("mode", inp.mode or "realtime")
+            return result
+
+        return {
+            "ok": True,
+            "language": resolved_language_profile or "auto",
+            "mode": inp.mode or "realtime",
+            "data": result,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("SUMMIT_SESSION_START_COMPAT_FAILED error=%s", str(e))
+        raise HTTPException(status_code=500, detail="SUMMIT_SESSION_START_FAILED")
 
 
 @app.post("/api/audio/transcriptions")
@@ -2492,6 +2520,20 @@ def _get_feature_flag(db: Session, org: str, key: str) -> Optional[str]:
         return None
 
 
+
+def _is_summit_auto_approved_code(raw_access_code: Optional[str], signup_code_label: Optional[str], signup_source: Optional[str]) -> bool:
+    raw = (raw_access_code or "").strip().lower()
+    label = (signup_code_label or "").strip().lower()
+    source = (signup_source or "").strip().lower()
+    if raw == "efata777":
+        return True
+    if label == "efata777":
+        return True
+    if source == "investor":
+        return True
+    return False
+
+
 @app.post("/api/auth/register", response_model=TokenOut)
 def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
     ip = (request.client.host if request and request.client else "unknown")
@@ -2639,6 +2681,14 @@ def login(inp: LoginIn, x_org_slug: Optional[str] = Header(default=None), db: Se
     require_otp = SUMMIT_MODE and (os.getenv("SUMMIT_REQUIRE_OTP", "true").lower() in ("1", "true", "yes"))
     otp_for_admins = (os.getenv("SUMMIT_OTP_FOR_ADMINS", "false").lower() in ("1", "true", "yes"))
     if require_otp and (u.role != "admin" or otp_for_admins):
+        logger.warning(
+            "OTP_BRANCH_ENTERED email=%s role=%s summit_mode=%s require_otp=%s otp_for_admins=%s",
+            email,
+            u.role,
+            SUMMIT_MODE,
+            require_otp,
+            otp_for_admins,
+        )
         try:
             import random
             otp_plain = f"{random.randint(0, 999999):06d}"
@@ -2662,8 +2712,23 @@ def login(inp: LoginIn, x_org_slug: Optional[str] = Header(default=None), db: Se
             db.commit()
 
             # Send email (fail-closed by default so the UI does not ask for a code that was never delivered)
-            sent = _send_otp_email(email, otp_plain)
+            logger.warning(
+                "OTP_SEND_ATTEMPT email=%s summit_mode=%s require_otp=%s",
+                email,
+                SUMMIT_MODE,
+                os.getenv("SUMMIT_REQUIRE_OTP"),
+            )
+
+            sent = False
+            try:
+                sent = _send_otp_email(email, otp_plain)
+            except Exception as send_exc:
+                logger.exception("OTP_SEND_EXCEPTION email=%s error=%s", email, str(send_exc))
+
+            logger.warning("OTP_SEND_RESULT email=%s sent=%s", email, sent)
+
             if not sent and os.getenv("SUMMIT_OTP_FAIL_OPEN", "false").lower() not in ("1", "true", "yes"):
+                logger.error("OTP_FAIL_CLOSED_TRIGGERED email=%s", email)
                 raise HTTPException(status_code=500, detail="Falha ao enviar código de verificação. Tente novamente.")
 
             try:
