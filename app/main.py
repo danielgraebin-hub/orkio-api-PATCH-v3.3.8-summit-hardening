@@ -6943,7 +6943,10 @@ def login_verify_otp(inp: OtpVerifyIn, request: Request = None, db: Session = De
         return response
 
     response["authenticated"] = True
-    response["redirect_to"] = "/app"
+    if _user_has_admin_console_access(u):
+        response["redirect_to"] = "/admin"
+    else:
+        response["redirect_to"] = "/app"
     response["message"] = "Acesso validado com sucesso."
     return response
 
