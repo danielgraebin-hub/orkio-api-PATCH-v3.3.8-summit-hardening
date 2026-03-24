@@ -1945,8 +1945,8 @@ app.include_router(user_router)
 class OnboardingPayloadCompat(BaseModel):
     company: Optional[str] = None
     role: Optional[str] = None
-    user_type: str
-    intent: str
+    user_type: Optional[str] = None
+    intent: Optional[str] = None
     notes: Optional[str] = None
     country: Optional[str] = None
     language: Optional[str] = None
@@ -1971,18 +1971,67 @@ def _save_user_onboarding_compat(
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
 
-    u.company = (payload.company or None)
-    u.profile_role = (payload.role or None)
-    u.user_type = (payload.user_type or "").strip()
-    u.intent = (payload.intent or "").strip()
-    u.notes = (payload.notes or None)
-    u.country = (payload.country or None)
-    u.language = (payload.language or None)
-    u.whatsapp = (payload.whatsapp or None)
-    u.onboarding_completed = bool(payload.onboarding_completed)
+    def _clean_text(value: Optional[str]) -> Optional[str]:
+        raw = str(value or "").strip()
+        return raw or None
 
-    if not u.user_type or not u.intent or not u.country or not u.language:
-        raise HTTPException(status_code=400, detail="Missing required fields")
+    def _normalize_country(value: Optional[str]) -> str:
+        raw = str(value or "").strip().upper()
+        return raw or "BR"
+
+    def _normalize_language(value: Optional[str], country: str) -> str:
+        raw = str(value or "").strip()
+        if raw:
+            return raw
+        if country == "BR":
+            return "pt-BR"
+        if country == "PT":
+            return "pt-PT"
+        if country in ("ES", "AR", "MX", "CO", "CL", "UY"):
+            return "es-ES"
+        return "en-US"
+
+    def _normalize_user_type(value: Optional[str]) -> str:
+        raw = str(value or "").strip().lower()
+        aliases = {
+            "founder": "founder",
+            "investor": "investor",
+            "operator": "operator",
+            "enterprise": "operator",
+            "developer": "operator",
+            "partner": "partner",
+            "other": "other",
+        }
+        return aliases.get(raw, "other")
+
+    def _normalize_intent(value: Optional[str]) -> str:
+        raw = str(value or "").strip().lower()
+        aliases = {
+            "explore": "explore",
+            "exploring": "explore",
+            "curious": "explore",
+            "meeting": "meeting",
+            "partnership": "meeting",
+            "pilot": "pilot",
+            "company_eval": "pilot",
+            "funding": "funding",
+            "investment": "funding",
+            "other": "other",
+        }
+        return aliases.get(raw, "explore")
+
+    country = _normalize_country(payload.country or getattr(u, "country", None))
+    language = _normalize_language(payload.language or getattr(u, "language", None), country)
+
+    u.company = _clean_text(payload.company) or getattr(u, "company", None)
+    u.profile_role = _clean_text(payload.role) or getattr(u, "profile_role", None)
+    u.user_type = _normalize_user_type(payload.user_type or getattr(u, "user_type", None))
+    u.intent = _normalize_intent(payload.intent or getattr(u, "intent", None))
+    u.notes = _clean_text(payload.notes) or getattr(u, "notes", None)
+    u.country = country
+    u.language = language
+    u.whatsapp = _clean_text(payload.whatsapp) or getattr(u, "whatsapp", None)
+    u.onboarding_completed = bool(payload.onboarding_completed)
 
     db.add(u)
     db.commit()
