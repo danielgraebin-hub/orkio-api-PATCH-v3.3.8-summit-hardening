@@ -1945,12 +1945,15 @@ app.include_router(user_router)
 class OnboardingPayloadCompat(BaseModel):
     company: Optional[str] = None
     role: Optional[str] = None
+    profile_role: Optional[str] = None
     user_type: Optional[str] = None
     intent: Optional[str] = None
     notes: Optional[str] = None
     country: Optional[str] = None
     language: Optional[str] = None
+    preferred_language: Optional[str] = None
     whatsapp: Optional[str] = None
+    whatsapp_number: Optional[str] = None
     onboarding_completed: bool = True
 
 
@@ -2020,17 +2023,41 @@ def _save_user_onboarding_compat(
         }
         return aliases.get(raw, "explore")
 
-    country = _normalize_country(payload.country or getattr(u, "country", None))
-    language = _normalize_language(payload.language or getattr(u, "language", None), country)
+    incoming_role = _clean_text(payload.role) or _clean_text(payload.profile_role)
+    incoming_country = _clean_text(payload.country) or getattr(u, "country", None)
+    incoming_language = (
+        _clean_text(payload.language)
+        or _clean_text(payload.preferred_language)
+        or getattr(u, "language", None)
+    )
+    incoming_whatsapp = _clean_text(payload.whatsapp) or _clean_text(payload.whatsapp_number)
+
+    country = _normalize_country(incoming_country)
+    language = _normalize_language(incoming_language, country)
+
+    try:
+        logger.warning(
+            "ONBOARDING_COMPAT_SAVE org=%s user_id=%s payload_keys=%s resolved={user_type=%s intent=%s country=%s language=%s has_whatsapp=%s}",
+            org,
+            uid,
+            sorted(list(payload.model_dump(exclude_none=False).keys())) if hasattr(payload, "model_dump") else [],
+            _normalize_user_type(payload.user_type or getattr(u, "user_type", None)),
+            _normalize_intent(payload.intent or getattr(u, "intent", None)),
+            country,
+            language,
+            bool(incoming_whatsapp),
+        )
+    except Exception:
+        pass
 
     u.company = _clean_text(payload.company) or getattr(u, "company", None)
-    u.profile_role = _clean_text(payload.role) or getattr(u, "profile_role", None)
+    u.profile_role = incoming_role or getattr(u, "profile_role", None)
     u.user_type = _normalize_user_type(payload.user_type or getattr(u, "user_type", None))
     u.intent = _normalize_intent(payload.intent or getattr(u, "intent", None))
     u.notes = _clean_text(payload.notes) or getattr(u, "notes", None)
     u.country = country
     u.language = language
-    u.whatsapp = _clean_text(payload.whatsapp) or getattr(u, "whatsapp", None)
+    u.whatsapp = incoming_whatsapp or getattr(u, "whatsapp", None)
     u.onboarding_completed = bool(payload.onboarding_completed)
 
     db.add(u)
