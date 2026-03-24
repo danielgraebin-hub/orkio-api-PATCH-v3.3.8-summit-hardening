@@ -3030,7 +3030,13 @@ def _orkio_welcome_message(name: Optional[str]) -> str:
 
 
 @app.get("/api/messages")
-def list_messages(thread_id: str, x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
+def list_messages(
+    thread_id: str,
+    include_welcome: bool = False,
+    x_org_slug: Optional[str] = Header(default=None),
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     org = get_request_org(user, x_org_slug)
     require_onboarding_complete(user)
     # PATCH0100_14: ACL check (admin bypass)
@@ -3038,7 +3044,7 @@ def list_messages(thread_id: str, x_org_slug: Optional[str] = Header(default=Non
         _require_thread_member(db, org, thread_id, user.get("sub"))
     rows = db.execute(select(Message).where(Message.org_slug == org, Message.thread_id == thread_id).order_by(Message.created_at.asc())).scalars().all()
 
-    if not rows:
+    if not rows and include_welcome:
         try:
             orkio = db.execute(
                 select(Agent).where(
@@ -5938,20 +5944,32 @@ async def realtime_start(
     db.commit()
 
     # Mint client secret using the same logic as /client_secret, but ensure instructions are injected.
-    r = await realtime_client_secret(
-        RealtimeClientSecretReq(
-            agent_id=agent_id,
-            voice=voice,
-            model=body.model,
-            ttl_seconds=body.ttl_seconds,
-            mode=summit_cfg.get("mode"),
-            response_profile=summit_cfg.get("response_profile"),
-            language_profile=summit_cfg.get("language_profile"),
-        ),
-        x_org_slug=x_org_slug,
-        user=user,
-        db=db,
-    )
+    try:
+        r = await realtime_client_secret(
+            RealtimeClientSecretReq(
+                agent_id=agent_id,
+                voice=voice,
+                model=body.model,
+                ttl_seconds=body.ttl_seconds,
+                mode=summit_cfg.get("mode"),
+                response_profile=summit_cfg.get("response_profile"),
+                language_profile=summit_cfg.get("language_profile"),
+            ),
+            x_org_slug=x_org_slug,
+            user=user,
+            db=db,
+        )
+    except Exception:
+        try:
+            rs.ended_at = now_ts()
+            db.add(rs)
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        raise
 
     # Audit
     _audit(db, org, uid, action="realtime.session.start", meta={
@@ -5970,6 +5988,11 @@ async def realtime_start(
         "session_id": sid,
         "thread_id": tid,
         "agent": {"id": agent_id, "name": agent_name},
+        "model": body.model,
+        "voice": voice,
+        "mode": summit_cfg.get("mode"),
+        "response_profile": summit_cfg.get("response_profile"),
+        "language_profile": summit_cfg.get("language_profile"),
         "client_secret": {"value": r.get("value")},
         "client_secret_value": r.get("value"),
         "realtime_session": r.get("session"),
@@ -7176,6 +7199,9 @@ class MeOut(BaseModel):
     role: str
     approved_at: Optional[int] = None
     usage_tier: Optional[str] = None
+    signup_source: Optional[str] = None
+    signup_code_label: Optional[str] = None
+    product_scope: Optional[str] = None
     terms_accepted_at: Optional[int] = None
     terms_version: Optional[str] = None
     marketing_consent: Optional[bool] = False
@@ -7184,6 +7210,9 @@ class MeOut(BaseModel):
     user_type: Optional[str] = None
     intent: Optional[str] = None
     notes: Optional[str] = None
+    country: Optional[str] = None
+    language: Optional[str] = None
+    whatsapp: Optional[str] = None
     onboarding_completed: Optional[bool] = False
 
 @app.get("/api/me", response_model=MeOut)
@@ -7200,6 +7229,8 @@ def get_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
         role=u.role,
         approved_at=u.approved_at,
         usage_tier=u.usage_tier,
+        signup_source=getattr(u, "signup_source", None),
+        signup_code_label=getattr(u, "signup_code_label", None),
         product_scope=getattr(u, "product_scope", None),
         terms_accepted_at=u.terms_accepted_at,
         terms_version=u.terms_version,
@@ -7209,6 +7240,9 @@ def get_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
         user_type=getattr(u, "user_type", None),
         intent=getattr(u, "intent", None),
         notes=getattr(u, "notes", None),
+        country=getattr(u, "country", None),
+        language=getattr(u, "language", None),
+        whatsapp=getattr(u, "whatsapp", None),
         onboarding_completed=bool(getattr(u, "onboarding_completed", False)),
     )
 
