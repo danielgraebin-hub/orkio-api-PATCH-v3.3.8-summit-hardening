@@ -478,13 +478,29 @@ def _ensure_admin_user_state(u: Optional[User]) -> bool:
 def _is_user_approved(u: Optional[User]) -> bool:
     return bool(u and ((getattr(u, "role", None) == "admin") or getattr(u, "approved_at", None)))
 
+def _user_has_admin_console_access(u: Optional[User]) -> bool:
+    if not u:
+        return False
+    role = (getattr(u, "role", "") or "").strip().lower()
+    if role in {"admin", "owner", "superadmin"}:
+        return True
+    if bool(getattr(u, "is_admin", False)):
+        return True
+    if bool(getattr(u, "admin", False)):
+        return True
+    return False
+
+
 def _serialize_user_payload(u: User, usage_tier: Optional[str] = None) -> Dict[str, Any]:
+    admin_access = _user_has_admin_console_access(u)
     return {
         "id": u.id,
         "org_slug": getattr(u, "org_slug", None),
         "email": u.email,
         "name": u.name,
         "role": u.role,
+        "is_admin": admin_access,
+        "admin": admin_access,
         "approved_at": getattr(u, "approved_at", None),
         "usage_tier": usage_tier or getattr(u, "usage_tier", None),
         "signup_code_label": getattr(u, "signup_code_label", None),
@@ -7197,6 +7213,8 @@ class MeOut(BaseModel):
     email: str
     name: str
     role: str
+    is_admin: Optional[bool] = False
+    admin: Optional[bool] = False
     approved_at: Optional[int] = None
     usage_tier: Optional[str] = None
     signup_source: Optional[str] = None
@@ -7221,12 +7239,15 @@ def get_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
     u = db.execute(select(User).where(User.id == uid)).scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    admin_access = _user_has_admin_console_access(u)
     return MeOut(
         id=u.id,
         org_slug=u.org_slug,
         email=u.email,
         name=u.name,
         role=u.role,
+        is_admin=admin_access,
+        admin=admin_access,
         approved_at=u.approved_at,
         usage_tier=u.usage_tier,
         signup_source=getattr(u, "signup_source", None),
