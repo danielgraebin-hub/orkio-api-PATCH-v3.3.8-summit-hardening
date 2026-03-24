@@ -221,7 +221,7 @@ def _summit_access_expired(payload_or_user: Any) -> bool:
         if role == "admin":
             return False
         usage_tier = (payload_or_user.get("usage_tier") if isinstance(payload_or_user, dict) else getattr(payload_or_user, "usage_tier", None)) or "summit_standard"
-        if usage_tier == "summit_vip":
+        if usage_tier in ("summit_vip", "summit_investor"):
             return False
         return now_ts() > int(SUMMIT_EXPIRES_AT)
     except Exception:
@@ -489,6 +489,7 @@ def _serialize_user_payload(u: User, usage_tier: Optional[str] = None) -> Dict[s
         "usage_tier": usage_tier or getattr(u, "usage_tier", None),
         "signup_code_label": getattr(u, "signup_code_label", None),
         "signup_source": getattr(u, "signup_source", None),
+        "product_scope": getattr(u, "product_scope", None),
         "company": getattr(u, "company", None),
         "profile_role": getattr(u, "profile_role", None),
         "user_type": getattr(u, "user_type", None),
@@ -508,11 +509,13 @@ def _auth_status_for_user(u: Optional[User]) -> str:
     usage_tier = (getattr(u, "usage_tier", "") or "").lower()
     signup_source = (getattr(u, "signup_source", "") or "").lower()
     signup_code_label = (getattr(u, "signup_code_label", "") or "").lower()
+    product_scope = (getattr(u, "product_scope", "") or "").lower()
 
     summit_eligible = (
         usage_tier.startswith("summit_")
         or signup_source == "investor"
         or signup_code_label == "efata777"
+        or product_scope == "full"
     )
 
     if not summit_eligible and not _is_user_approved(u):
@@ -546,6 +549,7 @@ def _build_auth_response(u: User, org: str, usage_tier: Optional[str], *, ip: Op
         "usage_tier": usage_tier,
         "signup_source": getattr(u, "signup_source", None),
         "signup_code_label": getattr(u, "signup_code_label", None),
+        "product_scope": getattr(u, "product_scope", None),
         "onboarding_completed": onboarding_completed,
     }
     payload["access_token"] = mint_token(token_payload)
@@ -1417,9 +1421,17 @@ def get_current_user(authorization: Optional[str] = Header(default=None)) -> Dic
     token = authorization.split(" ", 1)[1].strip()
     try:
         payload = decode_token(token)
-        if payload.get("role") != "admin" and payload.get("approved_at") is None:
+
+        summit_eligible = (
+            str(payload.get("usage_tier") or "").startswith("summit_")
+            or str(payload.get("signup_source") or "").lower() == "investor"
+            or str(payload.get("signup_code_label") or "").lower() == "efata777"
+            or str(payload.get("product_scope") or "").lower() == "full"
+        )
+
+        if payload.get("role") != "admin" and payload.get("approved_at") is None and not summit_eligible:
             raise HTTPException(status_code=403, detail="User pending approval")
-        # Summit access window: block standard users after expiration (fail-open on errors)
+
         try:
             if _summit_access_expired(payload):
                 raise HTTPException(status_code=403, detail="Acesso ao Summit encerrado.")
@@ -2585,12 +2597,18 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
 
     signup_code_label = None
     signup_source = None
-    usage_tier = "summit_standard"
+    usage_tier = "summit_investor"
+    product_scope = "full"
 
     if SUMMIT_MODE and not is_admin_email:
         if not inp.access_code:
             logger.warning("REGISTER_DENIED reason=missing_code ip=%s org=%s", ip, org)
             raise HTTPException(status_code=403, detail="Access code is required in Summit mode.")
+
+        normalized_input_code = (inp.access_code or "").strip().lower()
+        if normalized_input_code != "efata777":
+            logger.warning("REGISTER_DENIED reason=non_investor_code ip=%s org=%s", ip, org)
+            raise HTTPException(status_code=403, detail="Only investor access is enabled for this Summit build.")
 
         sc = _validate_access_code(db, org, inp.access_code)
         if not sc:
@@ -2605,12 +2623,17 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
 
         normalized_signup_source = (sc.source or "").strip().lower()
         normalized_signup_label = (sc.label or "").strip().lower()
-        normalized_input_code = (inp.access_code or "").strip().lower()
 
-        if normalized_signup_source == "investor" or normalized_signup_label == "efata777" or normalized_input_code == "efata777":
-            usage_tier = "summit_vip"
-        elif normalized_signup_source == "summit_user":
-            usage_tier = "summit_standard"
+        if normalized_signup_source != "investor" and normalized_signup_label != "efata777":
+            logger.warning("REGISTER_DENIED reason=non_investor_signup_source ip=%s org=%s", ip, org)
+            raise HTTPException(status_code=403, detail="Only investor access is enabled for this Summit build.")
+
+        usage_tier = "summit_investor"
+        product_scope = "full"
+
+    elif SUMMIT_MODE and is_admin_email:
+        usage_tier = "summit_admin"
+        product_scope = "full"
 
     elif inp.access_code:
         sc = _validate_access_code(db, org, inp.access_code)
@@ -2628,8 +2651,7 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    auto_approved_by_code = _is_summit_auto_approved_code(inp.access_code, signup_code_label, signup_source)
-    approved_at_value = now_ts() if (is_admin_email or auto_approved_by_code) else None
+    approved_at_value = now_ts() if (is_admin_email or (SUMMIT_MODE and not is_admin_email)) else None
 
     salt = new_salt()
     pw_hash = pbkdf2_hash(inp.password, salt)
@@ -2645,7 +2667,7 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
         created_at=now_ts(),
         approved_at=approved_at_value,
         signup_code_label=signup_code_label,
-        signup_source=signup_source,
+        signup_source=signup_source or ("investor" if SUMMIT_MODE and not is_admin_email else None),
         usage_tier=usage_tier,
         terms_accepted_at=(now_ts() if inp.accept_terms else None),
         terms_version=(TERMS_VERSION if inp.accept_terms else None),
@@ -2654,14 +2676,29 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     )
 
     try:
-        if auto_approved_by_code and hasattr(u, "approved_via"):
+        if SUMMIT_MODE and not is_admin_email:
+            # HARD ENFORCEMENT FOR INVESTOR-ONLY SUMMIT
+            usage_tier = "summit_investor"
+            signup_source = "investor" if not signup_source else signup_source
+            product_scope = "full"
+
+            if hasattr(u, "usage_tier"):
+                setattr(u, "usage_tier", "summit_investor")
+            if hasattr(u, "signup_source"):
+                setattr(u, "signup_source", "investor")
+            if hasattr(u, "product_scope"):
+                setattr(u, "product_scope", "full")
+
+        if hasattr(u, "approved_via") and SUMMIT_MODE and not is_admin_email:
             setattr(u, "approved_via", "access_code")
-        if auto_approved_by_code and hasattr(u, "access_code_used"):
+        if hasattr(u, "access_code_used") and SUMMIT_MODE and not is_admin_email:
             setattr(u, "access_code_used", (inp.access_code or "").strip().upper())
-        if auto_approved_by_code and hasattr(u, "status"):
+        if hasattr(u, "status"):
             setattr(u, "status", "active")
+        if hasattr(u, "product_scope") and getattr(u, "product_scope", None) in (None, "", "basic", "orkio"):
+            setattr(u, "product_scope", product_scope)
     except Exception:
-        logger.exception("REGISTER_AUTO_APPROVAL_METADATA_FAILED email=%s", email)
+        logger.exception("REGISTER_INVESTOR_METADATA_FAILED email=%s", email)
 
     db.add(u)
     db.commit()
@@ -2708,10 +2745,11 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
             meta={
                 "email": u.email,
                 "signup_code_label": signup_code_label,
-                "signup_source": signup_source,
-                "usage_tier": usage_tier,
+                "signup_source": getattr(u, "signup_source", None),
+                "usage_tier": getattr(u, "usage_tier", usage_tier),
+                "product_scope": getattr(u, "product_scope", product_scope),
                 "summit_mode": SUMMIT_MODE,
-                "auto_approved_by_code": auto_approved_by_code,
+                "investor_only": True,
             },
         )
     except Exception:
@@ -4199,6 +4237,7 @@ def admin_users(status: str = "all", _admin=Depends(require_admin_access), x_org
         "signup_code_label": getattr(u, "signup_code_label", None),
         "signup_source": getattr(u, "signup_source", None),
         "usage_tier": getattr(u, "usage_tier", "summit_standard"),
+        "product_scope": getattr(u, "product_scope", None),
         "terms_accepted_at": getattr(u, "terms_accepted_at", None),
         "terms_version": getattr(u, "terms_version", None),
         "marketing_consent": getattr(u, "marketing_consent", False),
@@ -7085,6 +7124,7 @@ def get_me(user=Depends(get_current_user), db: Session = Depends(get_db)):
         role=u.role,
         approved_at=u.approved_at,
         usage_tier=u.usage_tier,
+        product_scope=getattr(u, "product_scope", None),
         terms_accepted_at=u.terms_accepted_at,
         terms_version=u.terms_version,
         marketing_consent=bool(u.marketing_consent),
