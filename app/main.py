@@ -570,7 +570,7 @@ def _build_auth_response(u: User, org: str, usage_tier: Optional[str], *, ip: Op
     }
     payload["access_token"] = mint_token(token_payload)
     payload["token_type"] = "bearer"
-    payload["redirect_to"] = "/app"
+    payload["redirect_to"] = "/admin" if _user_has_admin_console_access(u) else "/app"
     return payload
 
 def enable_streaming() -> bool:
@@ -1468,6 +1468,38 @@ def require_onboarding_complete(payload: Dict[str, Any]) -> None:
         return
     raise HTTPException(status_code=403, detail="Onboarding incomplete")
 
+def require_onboarding_complete_db(
+    db: Session,
+    payload: Dict[str, Any],
+    *,
+    org_slug: Optional[str] = None,
+) -> User:
+    """
+    Source of truth for onboarding status must be the database, not the JWT.
+    This avoids stale-token regressions right after onboarding completion.
+    Returns the resolved user row for reuse by callers.
+    """
+    if payload.get("role") == "admin":
+        uid = payload.get("sub")
+        u = db.execute(select(User).where(User.id == uid)).scalar_one_or_none() if uid else None
+        if u:
+            return u
+        raise HTTPException(status_code=401, detail="User not found")
+
+    uid = payload.get("sub")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    stmt = select(User).where(User.id == uid)
+    if org_slug:
+        stmt = stmt.where(User.org_slug == org_slug)
+    u = db.execute(stmt).scalar_one_or_none()
+    if not u:
+        raise HTTPException(status_code=401, detail="User not found")
+    if not bool(getattr(u, "onboarding_completed", False)):
+        raise HTTPException(status_code=403, detail="Onboarding incomplete")
+    return u
+
 def require_admin(payload: Dict[str, Any]) -> None:
     if payload.get("role") == "admin":
         return
@@ -2079,7 +2111,30 @@ def _save_user_onboarding_compat(
     db.add(u)
     db.commit()
     db.refresh(u)
-    return {"status": "ok", "user": _serialize_user_payload(u)}
+
+    refreshed_user = _serialize_user_payload(u)
+    refreshed_token = mint_token({
+        "sub": u.id,
+        "org": u.org_slug,
+        "email": u.email,
+        "name": u.name,
+        "role": u.role,
+        "approved_at": getattr(u, "approved_at", None),
+        "usage_tier": getattr(u, "usage_tier", None),
+        "signup_source": getattr(u, "signup_source", None),
+        "signup_code_label": getattr(u, "signup_code_label", None),
+        "product_scope": getattr(u, "product_scope", None),
+        "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
+    })
+
+    return {
+        "status": "ok",
+        "user": refreshed_user,
+        "access_token": refreshed_token,
+        "token_type": "bearer",
+        "redirect_to": "/admin" if _user_has_admin_console_access(u) else "/app",
+        "onboarding_completed": bool(getattr(u, "onboarding_completed", False)),
+    }
 
 
 
@@ -3555,8 +3610,8 @@ def chat(
     db: Session = Depends(get_db),
     ):
     # STAB: resolve_org — tenant sempre do JWT
-    require_onboarding_complete(user)
     org = _resolve_org(user, x_org_slug)
+    db_user = require_onboarding_complete_db(db, user, org_slug=org)
     uid = user.get("sub")
 
     # Ensure thread (create if new, ACL-check if existing)
@@ -5896,10 +5951,10 @@ async def realtime_start(
     - client_secret value for browser WebRTC connection
     This ensures the realtime voice is never a generic assistant.
     """
-    require_onboarding_complete(user)
     org = _resolve_org(user, x_org_slug)
+    db_user = require_onboarding_complete_db(db, user, org_slug=org)
     uid = user.get("sub")
-    uname = user.get("name")
+    uname = getattr(db_user, "name", None) or user.get("name")
 
     # Resolve thread
     tid = body.thread_id
